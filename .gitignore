@@ -1,0 +1,10 @@
+# IntelliJ IDEA / JetBrains project files
+.idea/
+
+# macOS metadata
+.DS_Store
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
