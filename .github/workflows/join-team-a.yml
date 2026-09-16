@@ -83,12 +83,13 @@ jobs:
       - name: Comment result and close
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           MATCH_COUNT: ${{ steps.verify.outputs.count }}
         run: |
           if [ "$MATCH_COUNT" != "0" ]; then
-            gh issue comment "$ISSUE_NUMBER" --body "✅ 校验通过，已自动加入 Ponder team"
+            gh issue comment "$ISSUE_NUMBER" --repo "$GH_REPO" --body "✅ 校验通过，已自动加入 Ponder team"
           else
-            gh issue comment "$ISSUE_NUMBER" --body "❌ 订单号与 GitHub 账号不匹配，申请被拒绝"
+            gh issue comment "$ISSUE_NUMBER" --repo "$GH_REPO" --body "❌ 订单号与 GitHub 账号不匹配，申请被拒绝"
           fi
-          gh issue close "$ISSUE_NUMBER"
+          gh issue close "$ISSUE_NUMBER" --repo "$GH_REPO"
