@@ -1,8 +1,6 @@
-name: 申请加入 Team A
-description: 填写订单号申请加入 Team A
-title: "[申请Team A] "
-labels:
-  - join-team-a
+name: 申请加入 Ponder
+description: 填写订单号申请加入 Ponder
+title: "[申请Ponder] "
 body:
   - type: input
     id: order_no

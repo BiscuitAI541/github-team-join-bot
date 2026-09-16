@@ -1,4 +1,4 @@
-name: Auto Join Team A
+name: Auto Join Ponder
 
 on:
   issues:
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   verify-and-join:
-    if: contains(github.event.issue.labels.*.name, 'join-team-a')
+    if: startsWith(github.event.issue.title, '[申请Ponder]')
     runs-on: ubuntu-latest
 
     steps:
@@ -66,7 +66,7 @@ jobs:
           COUNT=$(echo "$RESULT" | jq -er '.data.total')
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
 
-      - name: Add to Team A
+      - name: Add to Ponder team
         if: steps.verify.outputs.count != '0'
         env:
           ORG_ADMIN_PAT: ${{ secrets.ORG_ADMIN_PAT }}
@@ -87,7 +87,7 @@ jobs:
           MATCH_COUNT: ${{ steps.verify.outputs.count }}
         run: |
           if [ "$MATCH_COUNT" != "0" ]; then
-            gh issue comment "$ISSUE_NUMBER" --body "✅ 校验通过，已自动加入 Team A"
+            gh issue comment "$ISSUE_NUMBER" --body "✅ 校验通过，已自动加入 Ponder team"
           else
             gh issue comment "$ISSUE_NUMBER" --body "❌ 订单号与 GitHub 账号不匹配，申请被拒绝"
           fi
