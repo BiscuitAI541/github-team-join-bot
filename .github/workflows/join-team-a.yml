@@ -1,0 +1,94 @@
+name: Auto Join Team A
+
+on:
+  issues:
+    types:
+      - opened
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  verify-and-join:
+    if: contains(github.event.issue.labels.*.name, 'join-team-a')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Parse issue form
+        id: parse
+        uses: stefanbuck/github-issue-parser@v3
+        with:
+          template-path: .github/ISSUE_TEMPLATE/join-team-a.yml
+
+      - name: Get Feishu tenant token
+        id: feishu_token
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+        run: |
+          TOKEN=$(curl --fail-with-body --silent --show-error \
+            -X POST "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg app_id "$FEISHU_APP_ID" \
+              --arg app_secret "$FEISHU_APP_SECRET" \
+              '{app_id: $app_id, app_secret: $app_secret}')" \
+            | jq -er '.tenant_access_token')
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Query bitable record
+        id: verify
+        env:
+          ORDER_NO: ${{ steps.parse.outputs.issueparser_order_no }}
+          GH_LOGIN: ${{ github.event.issue.user.login }}
+          FEISHU_TOKEN: ${{ steps.feishu_token.outputs.token }}
+          FEISHU_APP_TOKEN: ${{ secrets.FEISHU_APP_TOKEN }}
+          FEISHU_TABLE_ID: ${{ secrets.FEISHU_TABLE_ID }}
+        run: |
+          BODY=$(jq -n --arg order "$ORDER_NO" --arg login "$GH_LOGIN" '{
+            filter: {
+              conjunction: "and",
+              conditions: [
+                {field_name: "订单号", operator: "is", value: [$order]},
+                {field_name: "GitHub昵称", operator: "is", value: [$login]}
+              ]
+            }
+          }')
+
+          RESULT=$(curl --fail-with-body --silent --show-error \
+            -X POST \
+            "https://open.feishu.cn/open-apis/bitable/v1/apps/$FEISHU_APP_TOKEN/tables/$FEISHU_TABLE_ID/records/search" \
+            -H "Authorization: Bearer $FEISHU_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$BODY")
+
+          COUNT=$(echo "$RESULT" | jq -er '.data.total')
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Add to Team A
+        if: steps.verify.outputs.count != '0'
+        env:
+          ORG_ADMIN_PAT: ${{ secrets.ORG_ADMIN_PAT }}
+          ORGANIZATION: ${{ github.repository_owner }}
+          GH_LOGIN: ${{ github.event.issue.user.login }}
+        run: |
+          curl --fail-with-body --silent --show-error \
+            -X PUT \
+            -H "Authorization: Bearer $ORG_ADMIN_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/orgs/$ORGANIZATION/teams/ponder/memberships/$GH_LOGIN"
+
+      - name: Comment result and close
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          MATCH_COUNT: ${{ steps.verify.outputs.count }}
+        run: |
+          if [ "$MATCH_COUNT" != "0" ]; then
+            gh issue comment "$ISSUE_NUMBER" --body "✅ 校验通过，已自动加入 Team A"
+          else
+            gh issue comment "$ISSUE_NUMBER" --body "❌ 订单号与 GitHub 账号不匹配，申请被拒绝"
+          fi
+          gh issue close "$ISSUE_NUMBER"

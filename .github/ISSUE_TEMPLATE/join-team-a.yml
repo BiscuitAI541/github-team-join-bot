@@ -1,0 +1,14 @@
+name: 申请加入 Team A
+description: 填写订单号申请加入 Team A
+title: "[申请Team A] "
+labels:
+  - join-team-a
+body:
+  - type: input
+    id: order_no
+    attributes:
+      label: 订单号
+      description: 请填写你的订单号（如 P101）
+      placeholder: P101
+    validations:
+      required: true
