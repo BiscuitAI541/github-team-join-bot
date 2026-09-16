@@ -82,14 +82,32 @@ jobs:
 
       - name: Comment result and close
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          GH_API: https://api.github.com
           GH_REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           MATCH_COUNT: ${{ steps.verify.outputs.count }}
         run: |
           if [ "$MATCH_COUNT" != "0" ]; then
-            gh issue comment "$ISSUE_NUMBER" --repo "$GH_REPO" --body "✅ 校验通过，已自动加入 Ponder team"
+            COMMENT_BODY="✅ 校验通过，已自动加入 Ponder team"
           else
-            gh issue comment "$ISSUE_NUMBER" --repo "$GH_REPO" --body "❌ 订单号与 GitHub 账号不匹配，申请被拒绝"
+            COMMENT_BODY="❌ 订单号与 GitHub 账号不匹配，申请被拒绝"
           fi
-          gh issue close "$ISSUE_NUMBER" --repo "$GH_REPO"
+
+          curl --fail-with-body --silent --show-error \
+            -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg body "$COMMENT_BODY" '{body: $body}')" \
+            "$GH_API/repos/$GH_REPO/issues/$ISSUE_NUMBER/comments"
+
+          curl --fail-with-body --silent --show-error \
+            -X PATCH \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d '{"state":"closed"}' \
+            "$GH_API/repos/$GH_REPO/issues/$ISSUE_NUMBER"
