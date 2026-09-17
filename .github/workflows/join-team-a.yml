@@ -15,14 +15,24 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Parse issue form
+      - name: Parse order number from issue body
         id: parse
-        uses: stefanbuck/github-issue-parser@v3
-        with:
-          template-path: .github/ISSUE_TEMPLATE/join-team-a.yml
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          echo "::group::Issue 原文"
+          printf '%s\n' "$ISSUE_BODY"
+          echo "::endgroup::"
+
+          ORDER=$(printf '%s' "$ISSUE_BODY" \
+            | awk '/^###[[:space:]]*订单号/{f=1;next} f&&NF{gsub(/^[[:space:]]+|[[:space:]]+$/,"");print;exit}')
+
+          if [ -z "$ORDER" ]; then
+            ORDER=$(printf '%s' "$ISSUE_BODY" | grep -oE '\bP[0-9]{3,}\b' | head -1)
+          fi
+
+          printf '解析到的订单号: [%s]\n' "$ORDER"
+          echo "order_no=$ORDER" >> "$GITHUB_OUTPUT"
 
       - name: Get Feishu tenant token
         id: feishu_token
@@ -43,7 +53,7 @@ jobs:
       - name: Query bitable record
         id: verify
         env:
-          ORDER_NO: ${{ steps.parse.outputs.issueparser_order_no }}
+          ORDER_NO: ${{ steps.parse.outputs.order_no }}
           GH_LOGIN: ${{ github.event.issue.user.login }}
           FEISHU_TOKEN: ${{ steps.feishu_token.outputs.token }}
           FEISHU_APP_TOKEN: ${{ secrets.FEISHU_APP_TOKEN }}
@@ -55,7 +65,7 @@ jobs:
           echo "::endgroup::"
 
           if [ -z "$ORDER_NO" ]; then
-            echo "::error::订单号解析为空。请检查：1) 是否缺少 actions/checkout 步骤 2) Issue 是否通过表单模板创建"
+            echo "::error::未能从 Issue 正文解析出订单号，请查看上方 Issue 原文"
             exit 1
           fi
 
