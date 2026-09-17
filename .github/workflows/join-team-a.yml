@@ -20,10 +20,6 @@ jobs:
         env:
           ISSUE_BODY: ${{ github.event.issue.body }}
         run: |
-          echo "::group::Issue 原文"
-          printf '%s\n' "$ISSUE_BODY"
-          echo "::endgroup::"
-
           ORDER=$(printf '%s' "$ISSUE_BODY" \
             | awk '/^###[[:space:]]*订单号/{f=1;next} f&&NF{gsub(/^[[:space:]]+|[[:space:]]+$/,"");print;exit}')
 
@@ -31,7 +27,12 @@ jobs:
             ORDER=$(printf '%s' "$ISSUE_BODY" | grep -oE '\bP[0-9]{3,}\b' | head -1)
           fi
 
-          printf '解析到的订单号: [%s]\n' "$ORDER"
+          if [ -n "$ORDER" ]; then
+            echo "::add-mask::$ORDER"
+            echo "订单号解析成功（值已隐藏）"
+          else
+            echo "::warning::未解析出订单号"
+          fi
           echo "order_no=$ORDER" >> "$GITHUB_OUTPUT"
 
       - name: Get Feishu tenant token
@@ -60,12 +61,11 @@ jobs:
           FEISHU_TABLE_ID: ${{ secrets.FEISHU_TABLE_ID }}
         run: |
           echo "::group::诊断输入"
-          printf '解析到的订单号: [%s]\n' "$ORDER_NO"
           printf 'Issue 作者 login: [%s]\n' "$GH_LOGIN"
           echo "::endgroup::"
 
           if [ -z "$ORDER_NO" ]; then
-            echo "::error::未能从 Issue 正文解析出订单号，请查看上方 Issue 原文"
+            echo "::error::未能从 Issue 正文解析出订单号"
             exit 1
           fi
 
@@ -154,3 +154,27 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{"state":"closed"}' \
             "$GH_API/repos/$GH_REPO/issues/$ISSUE_NUMBER"
+
+      - name: Redact order number from issue body
+        if: always() && steps.parse.outputs.order_no != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_API: https://api.github.com
+          GH_REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ORIGINAL_BODY: ${{ github.event.issue.body }}
+          ORDER_NO: ${{ steps.parse.outputs.order_no }}
+        run: |
+          REDACTED=$(printf '%s' "$ORIGINAL_BODY" \
+            | ORDER="$ORDER_NO" awk '{gsub(ENVIRON["ORDER"], "[已脱敏]"); print}')
+
+          curl --fail-with-body --silent --show-error \
+            -X PATCH \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg body "$REDACTED" '{body: $body}')" \
+            "$GH_API/repos/$GH_REPO/issues/$ISSUE_NUMBER" > /dev/null
+
+          echo "订单号已从 Issue 正文中抹去"
