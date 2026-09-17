@@ -46,6 +46,31 @@ jobs:
           FEISHU_APP_TOKEN: ${{ secrets.FEISHU_APP_TOKEN }}
           FEISHU_TABLE_ID: ${{ secrets.FEISHU_TABLE_ID }}
         run: |
+          echo "::group::诊断输入"
+          printf '解析到的订单号: [%s]\n' "$ORDER_NO"
+          printf 'Issue 作者 login: [%s]\n' "$GH_LOGIN"
+          echo "::endgroup::"
+
+          if [ -z "$ORDER_NO" ]; then
+            echo "::error::订单号解析为空，请确认 Issue 是通过表单模板创建的"
+          fi
+
+          # 仅按订单号查一次，用于诊断表格里实际存的 GitHub昵称 是什么
+          DIAG_BODY=$(jq -n --arg order "$ORDER_NO" '{
+            filter: {conjunction: "and", conditions: [
+              {field_name: "订单号", operator: "is", value: [$order]}
+            ]}
+          }')
+          DIAG=$(curl --silent --show-error \
+            -X POST \
+            "https://open.feishu.cn/open-apis/bitable/v1/apps/$FEISHU_APP_TOKEN/tables/$FEISHU_TABLE_ID/records/search" \
+            -H "Authorization: Bearer $FEISHU_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$DIAG_BODY")
+          echo "::group::仅按订单号匹配的结果"
+          echo "$DIAG" | jq '{code, msg, total: .data.total, 昵称: [.data.items[]?.fields["GitHub昵称"]]}'
+          echo "::endgroup::"
+
           BODY=$(jq -n --arg order "$ORDER_NO" --arg login "$GH_LOGIN" '{
             filter: {
               conjunction: "and",
@@ -62,6 +87,10 @@ jobs:
             -H "Authorization: Bearer $FEISHU_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$BODY")
+
+          echo "::group::精确匹配的原始响应"
+          echo "$RESULT" | jq .
+          echo "::endgroup::"
 
           COUNT=$(echo "$RESULT" | jq -er '.data.total')
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
