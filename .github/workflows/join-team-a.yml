@@ -15,6 +15,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Parse issue form
         id: parse
         uses: stefanbuck/github-issue-parser@v3
@@ -52,7 +55,8 @@ jobs:
           echo "::endgroup::"
 
           if [ -z "$ORDER_NO" ]; then
-            echo "::error::订单号解析为空，请确认 Issue 是通过表单模板创建的"
+            echo "::error::订单号解析为空。请检查：1) 是否缺少 actions/checkout 步骤 2) Issue 是否通过表单模板创建"
+            exit 1
           fi
 
           # 仅按订单号查一次，用于诊断表格里实际存的 GitHub昵称 是什么
@@ -68,7 +72,7 @@ jobs:
             -H "Content-Type: application/json" \
             -d "$DIAG_BODY")
           echo "::group::仅按订单号匹配的结果"
-          echo "$DIAG" | jq '{code, msg, total: .data.total, 昵称: [.data.items[]?.fields["GitHub昵称"]]}'
+          echo "$DIAG" | jq '{code: .code, msg: .msg, total: .data.total, nicknames: [.data.items[]?.fields["GitHub昵称"]]}'
           echo "::endgroup::"
 
           BODY=$(jq -n --arg order "$ORDER_NO" --arg login "$GH_LOGIN" '{
