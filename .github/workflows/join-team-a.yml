@@ -19,7 +19,7 @@ jobs:
         id: parse
         env:
           ISSUE_BODY: ${{ github.event.issue.body }}
-          MIN_ORDER_NO: "P805453325948035361"
+          MIN_ORDER_NO: ${{ secrets.MIN_ORDER_NO }}
         run: |
           ORDER=$(printf '%s' "$ISSUE_BODY" \
             | awk '/^###[[:space:]]*订单号/{f=1;next} f&&NF{gsub(/^[[:space:]]+|[[:space:]]+$/,"");print;exit}')
@@ -48,6 +48,9 @@ jobs:
 
           if [ -n "$ORDER" ]; then
             echo "::add-mask::$ORDER"
+          fi
+          if [ -n "$MIN_ORDER_NO" ]; then
+            echo "::add-mask::$MIN_ORDER_NO"
           fi
 
           if [ "$VALID" = "true" ]; then
