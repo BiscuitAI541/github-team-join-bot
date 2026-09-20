@@ -32,9 +32,9 @@ jobs:
           REASON=""
 
           if [ -z "$ORDER" ]; then
-            REASON="未能从 Issue 正文解析出订单号"
+            REASON="订单号错误"
           elif ! [[ "$ORDER" =~ ^P[0-9]{18}$ ]]; then
-            REASON="订单号格式不正确，应为 P 开头 + 18 位数字"
+            REASON="订单号错误"
           else
             ORDER_DIGITS="${ORDER#P}"
             MIN_DIGITS="${MIN_ORDER_NO#P}"
@@ -42,7 +42,7 @@ jobs:
             if (( 10#$ORDER_DIGITS > 10#$MIN_DIGITS )); then
               VALID="true"
             else
-              REASON="订单号未大于最小允许值（$MIN_ORDER_NO），可能是过期或无效订单"
+              REASON="订单号错误"
             fi
           fi
 
@@ -133,10 +133,10 @@ jobs:
               if [ "$MATCH" = "null" ] || [ -z "$MATCH" ]; then
                 if [ "$(echo "$DIAG" | jq -r '.data.total')" = "0" ]; then
                   decision="reject_not_found"
-                  reason="订单号在系统中不存在"
+                  reason="订单号错误"
                 else
                   decision="reject_mismatch"
-                  reason="订单号与 GitHub 账号不匹配"
+                  reason="订单号错误"
                 fi
               else
                 decision="join"
@@ -211,7 +211,7 @@ jobs:
           elif [ "$DECISION" = "join" ]; then
             COMMENT_BODY="❌ 校验通过，但加入组织失败，请联系管理员处理"
           else
-            COMMENT_BODY="❌ 申请被拒绝：${FAIL_REASON:-订单号与 GitHub 账号不匹配}"
+            COMMENT_BODY="❌ 申请被拒绝：${FAIL_REASON:-订单号错误}"
           fi
 
           curl --fail-with-body --silent --show-error \
