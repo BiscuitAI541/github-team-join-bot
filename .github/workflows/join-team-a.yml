@@ -15,10 +15,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Parse order number from issue body
+      - name: Parse and validate order number from issue body
         id: parse
         env:
           ISSUE_BODY: ${{ github.event.issue.body }}
+          MIN_ORDER_NO: "P805453325948035361"
         run: |
           ORDER=$(printf '%s' "$ISSUE_BODY" \
             | awk '/^###[[:space:]]*订单号/{f=1;next} f&&NF{gsub(/^[[:space:]]+|[[:space:]]+$/,"");print;exit}')
@@ -27,16 +28,41 @@ jobs:
             ORDER=$(printf '%s' "$ISSUE_BODY" | grep -oE '\bP[0-9]{3,}\b' | head -1)
           fi
 
+          VALID="false"
+          REASON=""
+
+          if [ -z "$ORDER" ]; then
+            REASON="未能从 Issue 正文解析出订单号"
+          elif ! [[ "$ORDER" =~ ^P[0-9]{18}$ ]]; then
+            REASON="订单号格式不正确，应为 P 开头 + 18 位数字"
+          else
+            ORDER_DIGITS="${ORDER#P}"
+            MIN_DIGITS="${MIN_ORDER_NO#P}"
+            # 18 位数字在 int64 范围内不会溢出；用 10# 强制十进制，避免前导零被当八进制解析
+            if (( 10#$ORDER_DIGITS > 10#$MIN_DIGITS )); then
+              VALID="true"
+            else
+              REASON="订单号未大于最小允许值（$MIN_ORDER_NO），可能是过期或无效订单"
+            fi
+          fi
+
           if [ -n "$ORDER" ]; then
             echo "::add-mask::$ORDER"
-            echo "订单号解析成功（值已隐藏）"
-          else
-            echo "::warning::未解析出订单号"
           fi
+
+          if [ "$VALID" = "true" ]; then
+            echo "订单号校验通过（值已隐藏）"
+          else
+            echo "::warning::订单号校验失败：$REASON"
+          fi
+
           echo "order_no=$ORDER" >> "$GITHUB_OUTPUT"
+          echo "order_valid=$VALID" >> "$GITHUB_OUTPUT"
+          echo "reject_reason=$REASON" >> "$GITHUB_OUTPUT"
 
       - name: Get Feishu tenant token
         id: feishu_token
+        if: steps.parse.outputs.order_valid == 'true'
         env:
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
@@ -55,6 +81,8 @@ jobs:
         id: verify
         env:
           ORDER_NO: ${{ steps.parse.outputs.order_no }}
+          ORDER_VALID: ${{ steps.parse.outputs.order_valid }}
+          REJECT_REASON: ${{ steps.parse.outputs.reject_reason }}
           GH_LOGIN: ${{ github.event.issue.user.login }}
           FEISHU_TOKEN: ${{ steps.feishu_token.outputs.token }}
           FEISHU_APP_TOKEN: ${{ secrets.FEISHU_APP_TOKEN }}
@@ -64,53 +92,64 @@ jobs:
           printf 'Issue 作者 login: [%s]\n' "$GH_LOGIN"
           echo "::endgroup::"
 
-          if [ -z "$ORDER_NO" ]; then
-            echo "::error::未能从 Issue 正文解析出订单号"
-            exit 1
+          # decision 取值：join / reject_invalid / reject_duplicate / reject_mismatch / reject_not_found
+          decision=""
+          reason=""
+          record_id=""
+
+          if [ "$ORDER_VALID" != "true" ]; then
+            decision="reject_invalid"
+            reason="$REJECT_REASON"
+          else
+            # 按订单号查出所有匹配记录，用于判断是否已存在「已完成」的申请（同一订单被重复申请）
+            DIAG_BODY=$(jq -n --arg order "$ORDER_NO" '{
+              filter: {conjunction: "and", conditions: [
+                {field_name: "订单号", operator: "is", value: [$order]}
+              ]}
+            }')
+            DIAG=$(curl --fail-with-body --silent --show-error \
+              -X POST \
+              "https://open.feishu.cn/open-apis/bitable/v1/apps/$FEISHU_APP_TOKEN/tables/$FEISHU_TABLE_ID/records/search" \
+              -H "Authorization: Bearer $FEISHU_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$DIAG_BODY")
+            echo "::group::按订单号匹配的全部记录"
+            echo "$DIAG" | jq '{code: .code, msg: .msg, total: .data.total, records: [.data.items[]? | {nickname: .fields["GitHub昵称"], status: .fields["状态"]}]}'
+            echo "::endgroup::"
+
+            HAS_COMPLETED=$(echo "$DIAG" | jq -r '[.data.items[]? | select(.fields["状态"]=="已完成")] | length')
+
+            if [ "$HAS_COMPLETED" != "0" ]; then
+              decision="reject_duplicate"
+              reason="之前的账号申请过，请勿重复申请"
+            else
+              # 在同订单号的记录里，进一步筛选 GitHub 昵称精确匹配的那一条，拿到 record_id 供后续更新状态
+              MATCH=$(echo "$DIAG" | jq -c --arg login "$GH_LOGIN" '[.data.items[]? | select(.fields["GitHub昵称"]==$login)] | first')
+
+              if [ "$MATCH" = "null" ] || [ -z "$MATCH" ]; then
+                if [ "$(echo "$DIAG" | jq -r '.data.total')" = "0" ]; then
+                  decision="reject_not_found"
+                  reason="订单号在系统中不存在"
+                else
+                  decision="reject_mismatch"
+                  reason="订单号与 GitHub 账号不匹配"
+                fi
+              else
+                decision="join"
+                reason=""
+                record_id=$(echo "$MATCH" | jq -r '.record_id')
+              fi
+            fi
           fi
 
-          # 仅按订单号查一次，用于诊断表格里实际存的 GitHub昵称 是什么
-          DIAG_BODY=$(jq -n --arg order "$ORDER_NO" '{
-            filter: {conjunction: "and", conditions: [
-              {field_name: "订单号", operator: "is", value: [$order]}
-            ]}
-          }')
-          DIAG=$(curl --silent --show-error \
-            -X POST \
-            "https://open.feishu.cn/open-apis/bitable/v1/apps/$FEISHU_APP_TOKEN/tables/$FEISHU_TABLE_ID/records/search" \
-            -H "Authorization: Bearer $FEISHU_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "$DIAG_BODY")
-          echo "::group::仅按订单号匹配的结果"
-          echo "$DIAG" | jq '{code: .code, msg: .msg, total: .data.total, nicknames: [.data.items[]?.fields["GitHub昵称"]]}'
-          echo "::endgroup::"
-
-          BODY=$(jq -n --arg order "$ORDER_NO" --arg login "$GH_LOGIN" '{
-            filter: {
-              conjunction: "and",
-              conditions: [
-                {field_name: "订单号", operator: "is", value: [$order]},
-                {field_name: "GitHub昵称", operator: "is", value: [$login]}
-              ]
-            }
-          }')
-
-          RESULT=$(curl --fail-with-body --silent --show-error \
-            -X POST \
-            "https://open.feishu.cn/open-apis/bitable/v1/apps/$FEISHU_APP_TOKEN/tables/$FEISHU_TABLE_ID/records/search" \
-            -H "Authorization: Bearer $FEISHU_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "$BODY")
-
-          echo "::group::精确匹配的原始响应"
-          echo "$RESULT" | jq .
-          echo "::endgroup::"
-
-          COUNT=$(echo "$RESULT" | jq -er '.data.total')
-          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "decision=$decision" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          echo "record_id=$record_id" >> "$GITHUB_OUTPUT"
 
       - name: Add to Ponder team
-        if: steps.verify.outputs.count != '0'
+        id: add_member
+        if: steps.verify.outputs.decision == 'join'
+        continue-on-error: true
         env:
           ORG_ADMIN_PAT: ${{ secrets.ORG_ADMIN_PAT }}
           ORGANIZATION: ${{ github.repository_owner }}
@@ -123,18 +162,52 @@ jobs:
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/orgs/$ORGANIZATION/teams/ponder/memberships/$GH_LOGIN"
 
+      - name: Update Feishu record status
+        if: steps.verify.outputs.decision == 'join'
+        env:
+          FEISHU_TOKEN: ${{ steps.feishu_token.outputs.token }}
+          FEISHU_APP_TOKEN: ${{ secrets.FEISHU_APP_TOKEN }}
+          FEISHU_TABLE_ID: ${{ secrets.FEISHU_TABLE_ID }}
+          RECORD_ID: ${{ steps.verify.outputs.record_id }}
+          ADD_OUTCOME: ${{ steps.add_member.outcome }}
+        run: |
+          if [ "$ADD_OUTCOME" = "success" ]; then
+            NEW_STATUS="已完成"
+          else
+            NEW_STATUS="失败"
+          fi
+
+          BODY=$(jq -n --arg status "$NEW_STATUS" '{fields: {"状态": $status}}')
+
+          curl --fail-with-body --silent --show-error \
+            -X PUT \
+            "https://open.feishu.cn/open-apis/bitable/v1/apps/$FEISHU_APP_TOKEN/tables/$FEISHU_TABLE_ID/records/$RECORD_ID" \
+            -H "Authorization: Bearer $FEISHU_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$BODY"
+
+          if [ "$ADD_OUTCOME" != "success" ]; then
+            echo "::error::加入组织失败，已将表格状态标记为「失败」"
+            exit 1
+          fi
+
       - name: Comment result and close
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
           GH_API: https://api.github.com
           GH_REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
-          MATCH_COUNT: ${{ steps.verify.outputs.count }}
+          DECISION: ${{ steps.verify.outputs.decision }}
+          FAIL_REASON: ${{ steps.verify.outputs.reason }}
+          ADD_OUTCOME: ${{ steps.add_member.outcome }}
         run: |
-          if [ "$MATCH_COUNT" != "0" ]; then
+          if [ "$DECISION" = "join" ] && [ "$ADD_OUTCOME" = "success" ]; then
             COMMENT_BODY="✅ 校验通过，已自动加入 Ponder team"
+          elif [ "$DECISION" = "join" ]; then
+            COMMENT_BODY="❌ 校验通过，但加入组织失败，请联系管理员处理"
           else
-            COMMENT_BODY="❌ 订单号与 GitHub 账号不匹配，申请被拒绝"
+            COMMENT_BODY="❌ 申请被拒绝：${FAIL_REASON:-订单号与 GitHub 账号不匹配}"
           fi
 
           curl --fail-with-body --silent --show-error \
