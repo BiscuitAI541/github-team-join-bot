@@ -113,18 +113,22 @@ jobs:
               -H "Authorization: Bearer $FEISHU_TOKEN" \
               -H "Content-Type: application/json" \
               -d "$DIAG_BODY")
+            # 飞书多维表格的文本字段返回的可能是纯字符串，也可能是富文本数组（[{text,type},...]），
+            # 这里统一转成纯文本再比较，避免数组直接和字符串做 == 永远为 false 的坑
+            JQ_FIELDTEXT='def fieldtext(f): if f == null then "" elif (f|type)=="string" then f elif (f|type)=="array" then (f | map(.text // "") | join("")) else (f|tostring) end;'
+
             echo "::group::按订单号匹配的全部记录"
-            echo "$DIAG" | jq '{code: .code, msg: .msg, total: .data.total, records: [.data.items[]? | {nickname: .fields["GitHub昵称"], status: .fields["状态"]}]}'
+            echo "$DIAG" | jq "$JQ_FIELDTEXT"' {code: .code, msg: .msg, total: .data.total, records: [.data.items[]? | {nickname: fieldtext(.fields["GitHub昵称"]), status: fieldtext(.fields["状态"])}]}'
             echo "::endgroup::"
 
-            HAS_COMPLETED=$(echo "$DIAG" | jq -r '[.data.items[]? | select(.fields["状态"]=="已完成")] | length')
+            HAS_COMPLETED=$(echo "$DIAG" | jq -r "$JQ_FIELDTEXT"' [.data.items[]? | select(fieldtext(.fields["状态"])=="已完成")] | length')
 
             if [ "$HAS_COMPLETED" != "0" ]; then
               decision="reject_duplicate"
               reason="之前的账号申请过，请勿重复申请"
             else
               # 在同订单号的记录里，进一步筛选 GitHub 昵称精确匹配的那一条，拿到 record_id 供后续更新状态
-              MATCH=$(echo "$DIAG" | jq -c --arg login "$GH_LOGIN" '[.data.items[]? | select(.fields["GitHub昵称"]==$login)] | first')
+              MATCH=$(echo "$DIAG" | jq -c --arg login "$GH_LOGIN" "$JQ_FIELDTEXT"' [.data.items[]? | select(fieldtext(.fields["GitHub昵称"])==$login)] | first')
 
               if [ "$MATCH" = "null" ] || [ -z "$MATCH" ]; then
                 if [ "$(echo "$DIAG" | jq -r '.data.total')" = "0" ]; then
