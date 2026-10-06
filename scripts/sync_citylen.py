@@ -189,11 +189,24 @@ class GitHub:
 
 
 def validate(order, email, minimum):
-    if not ORDER_PATTERN.fullmatch(order) or int(order[1:]) <= int(minimum[1:]):
-        return "订单号格式或范围不符合规则"
+    if not order:
+        return "未填写订单号"
+    if not ORDER_PATTERN.fullmatch(order):
+        return "订单号格式错误，必须为 P 开头加 18 位数字"
+    if int(order[1:]) <= int(minimum[1:]):
+        return "订单号不大于配置的最小订单号"
+    if not email:
+        return "未填写 github账号邮箱"
     if not EMAIL_PATTERN.fullmatch(email):
-        return "请填写 GitHub 账号中已验证的完整邮箱"
+        return "邮箱格式错误，请填写 GitHub 账号中已验证的完整邮箱"
     return ""
+
+
+def phase(fields):
+    """兼容旧状态；新状态将阶段和原因一起写进用户可见的完成状态列。"""
+    status = fieldtext(fields.get(STATUS))
+    match = re.match(r"^未完成（([^）]+)）：", status)
+    return match.group(1) if match else status
 
 
 class Sync:
@@ -202,7 +215,8 @@ class Sync:
         self.errors, self.sent = 0, 0
 
     def update(self, record, status, note, **extra):
-        self.feishu.update(record, {STATUS: status, NOTE: note, **extra})
+        visible = "已完成" if status == "已完成" else f"未完成（{status}）：{note}"
+        self.feishu.update(record, {STATUS: visible, NOTE: note, **extra})
 
     def matching_invitation(self, pending, fields):
         invitation_id = fieldtext(fields.get(INVITE_ID))
@@ -216,101 +230,169 @@ class Sync:
         invitation = self.matching_invitation(pending, fields)
         if invitation:
             login = invitation.get("login") or fieldtext(fields.get(LOGIN))
-            self.update(record, "邀请待接受", "邀请已发送，请在 GitHub 接受", **{
+            self.update(record, "已完成", "邀请已发送，用户仍需在 GitHub 接受", **{
                 INVITE_ID: str(invitation["id"]), LOGIN: login})
             return True
         login = fieldtext(fields.get(LOGIN))
         if self.github.active(team, login):
             self.update(record, "已完成", "已确认目标 Team 成员状态为 active")
             return True
-        if fieldtext(fields.get(STATUS)) == "待重试":
+        if phase(fields) == "待重试":
             return False
         self.update(record, "结果待确认", "未找到待接受邀请，也未确认目标 Team 成员；保留绑定，不自动重复邀请")
         return True
 
+    def reservations(self, records):
+        """先扫描全部历史，已完成记录即使没有新增绑定列，也会占用订单。"""
+        owners = {}
+        # 已完成记录优先于任何未完成绑定，不能只依赖本轮遍历顺序。
+        for completed in (True, False):
+            for record in records:
+                fields = record["fields"]
+                if (phase(fields) in ("已完成", "邀请待接受")) != completed:
+                    continue
+                order = fieldtext(fields.get(BOUND_ORDER))
+                if not order and fieldtext(fields.get(BOUND_EMAIL)):
+                    order = fieldtext(fields.get(ORDER))
+                if completed:
+                    order = order or fieldtext(fields.get(ORDER))
+                if order:
+                    owners.setdefault(order, record)
+        return owners
+
+    def duplicate_reason(self, owner, email):
+        fields = owner["fields"]
+        existing_email = (fieldtext(fields.get(BOUND_EMAIL)) or fieldtext(fields.get(EMAIL))).casefold()
+        if phase(fields) in ("已完成", "邀请待接受"):
+            return "此订单已有已完成记录，请勿重复申请；同一订单仅允许一个 GitHub 邮箱"
+        if existing_email and existing_email != email:
+            return "此订单已绑定其他 GitHub 邮箱，同一订单不能为多个邮箱开通"
+        return "此订单已有绑定申请，请勿重复提交；同一订单仅处理一条申请记录"
+
+    def process(self, record, owners, team, pending):
+        fields = record["fields"]
+        status = phase(fields)
+        bound_order = fieldtext(fields.get(BOUND_ORDER))
+        bound_email = fieldtext(fields.get(BOUND_EMAIL)).casefold()
+        order = bound_order or fieldtext(fields.get(ORDER))
+        email = bound_email or fieldtext(fields.get(EMAIL)).casefold()
+        owner = owners.get(order)
+        # 在状态跳过判断之前拦截重复行，历史绑定和已完成订单均不可重新占用。
+        if owner and owner["record_id"] != record["record_id"]:
+            self.update(record, "重复申请", self.duplicate_reason(owner, email))
+            return
+        if bound_order or bound_email:
+            if not bound_order or not bound_email:
+                self.errors += 1
+                self.update(record, "绑定异常", "历史订单绑定不完整，不能发送邀请")
+                return
+            if (fieldtext(fields.get(ORDER)) != bound_order
+                    or fieldtext(fields.get(EMAIL)).casefold() != bound_email):
+                self.update(record, "绑定不一致", "订单号或邮箱与已保存的绑定不一致，不会重新授权")
+                return
+        if status == "已完成":
+            return
+        if bound_order:
+            if status in ("邀请失败", "绑定不一致", "绑定异常"):
+                # 将旧版只有阶段名的状态补齐原因，不自动重试明确失败。
+                self.update(record, status, fieldtext(fields.get(NOTE)) or "历史申请未完成，订单绑定保留")
+                return
+            if self.reconcile(record, team, pending):
+                return
+        else:
+            if status not in ("", "待处理", "未完成", "待重试"):
+                if status in ("已拒绝", "重复申请"):
+                    self.update(record, status, fieldtext(fields.get(NOTE)) or "历史申请未通过")
+                return
+            reason = validate(order, email, self.config.min_order)
+            if reason:
+                self.update(record, "已拒绝", reason)
+                return
+            # 先保存绑定，之后哪怕邀请超时或回写失败，也不允许另一邮箱占用订单。
+            self.update(record, "处理中", "已绑定订单与邮箱，正在核对邀请", **{
+                BOUND_ORDER: order, BOUND_EMAIL: email, INVITE_ID: "", LOGIN: ""})
+            owners[order] = record
+            if self.matching_invitation(pending, record["fields"]):
+                self.reconcile(record, team, pending)
+                return
+        if self.sent >= self.config.max_invites:
+            self.update(record, "待重试", "本轮邀请数量达到上限，下轮继续处理")
+            return
+        self.sent += 1
+        self.update(record, "处理中", "正在发送 GitHub 邀请")
+        try:
+            invitation = self.github.invite(team, email)
+        except ApiError as exc:
+            self.errors += 1
+            if exc.status in (400, 403, 404, 422, 429):
+                reasons = {400: "GitHub 请求参数错误", 403: "GitHub 拒绝请求，权限或组织策略限制",
+                           404: "GitHub 未找到目标资源或凭证无访问权限",
+                           422: "GitHub 邀请校验失败", 429: "GitHub 请求频率超限"}
+                self.update(record, "待重试" if exc.status in (403, 429) else "邀请失败",
+                            f"{reasons[exc.status]}（HTTP {exc.status}），订单绑定保留")
+            else:
+                self.update(record, "结果待确认", "GitHub 邀请响应未知，先核对状态，不自动重新发送")
+            return
+        if not invitation.get("id"):
+            self.errors += 1
+            self.update(record, "结果待确认", "GitHub 邀请响应缺少 ID，不自动重新发送")
+            return
+        pending.append(invitation)
+        self.update(record, "已完成", "邀请已发送，用户仍需在 GitHub 接受", **{
+            INVITE_ID: str(invitation["id"]), LOGIN: invitation.get("login") or ""})
+
     def run(self):
         records = self.feishu.records()
-        required = {ORDER, EMAIL, STATUS, NOTE, INVITE_ID, LOGIN, BOUND_ORDER, BOUND_EMAIL}
-        # 所有历史绑定都参与去重，包括处于未知结果状态的记录。
-        reservations = {}
+        # 有创建时间时按创建顺序处理；没有时保持接口顺序，不按随机 record_id 排序。
+        records.sort(key=lambda r: r.get("created_time") or 0)
         for record in records:
-            fields = record.get("fields", {})
-            order = fieldtext(fields.get(BOUND_ORDER))
-            email = fieldtext(fields.get(BOUND_EMAIL))
-            if bool(order) != bool(email):
-                raise ValueError("发现不完整的订单绑定，本次停止处理")
-            if order:
-                if order in reservations:
-                    raise ValueError("同一订单存在多条历史绑定，本次停止处理")
-                reservations[order] = record["record_id"]
-            if not {ORDER, EMAIL}.issubset(fields):
-                # 空表无需创建任何邀请；有记录但缺输入字段时及时报告。
-                raise ValueError("记录缺少订单号或 github账号邮箱字段，请检查表格列名")
-            for field in required:
-                mask(fieldtext(fields.get(field)))
-
-        team = self.github.team()
-        pending = self.github.pending(team)
-        # 同一批重复订单按创建时间排序，绑定成功后其他申请不会再发送。
-        records.sort(key=lambda r: (r.get("created_time", 0), r["record_id"]))
+            record.setdefault("fields", {})
+            for value in record["fields"].values():
+                mask(fieldtext(value))
+            # 历史待接受状态已证明邀请发送成功，按新的“邀请已发出”口径迁移。
+            # 先迁移再建立订单索引，后续重复申请也会被已完成记录拦截。
+            if not self.config.dry_run and phase(record["fields"]) == "邀请待接受":
+                self.update(record, "已完成", "历史邀请已发送，用户仍需在 GitHub 接受")
+        owners = self.reservations(records)
+        try:
+            team = self.github.team()
+            pending = self.github.pending(team)
+        except (ApiError, ValueError) as exc:
+            if not self.config.dry_run:
+                for record in records:
+                    fields = record["fields"]
+                    if phase(fields) in ("已完成", "已拒绝", "重复申请", "邀请失败"):
+                        continue
+                    state = "结果待确认" if fieldtext(fields.get(BOUND_ORDER)) else "待重试"
+                    self.update(record, state, f"无法核对目标 Team 或邀请列表：{exc}")
+            return 1
         for record in records:
-            fields = record["fields"]
-            status = fieldtext(fields.get(STATUS))
-            bound = fieldtext(fields.get(BOUND_ORDER))
             if self.config.dry_run:
-                # 预演不修改飞书、不发送邀请，仅统计符合规则的未绑定申请。
-                if not bound and status in ("", "待处理"):
-                    reason = validate(fieldtext(fields.get(ORDER)), fieldtext(fields.get(EMAIL)), self.config.min_order)
-                    print("预演：" + (reason or "规则通过，正式运行将检查绑定并邀请"))
-                continue
-            if bound:
-                if status in ("已完成", "邀请失败"):
-                    continue
-                if self.reconcile(record, team, pending):
-                    continue
-                order = bound
-                email = fieldtext(fields.get(BOUND_EMAIL))
-            else:
-                if status not in ("", "待处理"):
-                    continue
-                order, email = fieldtext(fields.get(ORDER)), fieldtext(fields.get(EMAIL)).casefold()
-                reason = validate(order, email, self.config.min_order)
-                if reason:
-                    self.update(record, "已拒绝", reason)
-                    continue
-                if order in reservations:
-                    self.update(record, "重复申请", "此订单已经绑定申请记录，不再为其他记录开通")
-                    continue
-                # 先写入持久绑定再调用 GitHub，崩溃、取消或回写失败后仍有恢复依据。
-                self.update(record, "处理中", "已绑定订单与邮箱，正在核对邀请", **{
-                    BOUND_ORDER: order, BOUND_EMAIL: email, INVITE_ID: "", LOGIN: ""})
-                reservations[order] = record["record_id"]
-                if self.matching_invitation(pending, record["fields"]):
-                    self.reconcile(record, team, pending)
-                    continue
-            if self.sent >= self.config.max_invites:
-                self.update(record, "待重试", "本轮邀请数量达到上限，下轮继续处理")
-                continue
-            self.sent += 1
-            # 重试也先改为处理中：如果进程在 POST 后被取消，下次不能按待重试直接重发。
-            self.update(record, "处理中", "正在发送 GitHub 邀请")
-            try:
-                invitation = self.github.invite(team, email)
-            except ApiError as exc:
-                self.errors += 1
-                if exc.status in (400, 403, 404, 422, 429):
-                    self.update(record, "待重试" if exc.status in (403, 429) else "邀请失败",
-                                f"GitHub 拒绝请求（HTTP {exc.status}）；订单绑定保留")
+                fields = record["fields"]
+                order = fieldtext(fields.get(BOUND_ORDER)) or fieldtext(fields.get(ORDER))
+                email = (fieldtext(fields.get(BOUND_EMAIL)) or fieldtext(fields.get(EMAIL))).casefold()
+                owner = owners.get(order)
+                if phase(fields) in ("已完成", "邀请待接受"):
+                    message = "邀请已完成，不重复发送；历史待接受状态正式运行会迁移为已完成"
+                elif owner and owner["record_id"] != record["record_id"]:
+                    message = self.duplicate_reason(owner, email)
+                elif fieldtext(fields.get(BOUND_ORDER)):
+                    message = "已有绑定，正式运行先核对邀请状态"
                 else:
-                    self.update(record, "结果待确认", "邀请响应未知，下次先核对 GitHub，不自动重新发送")
+                    message = validate(order, email, self.config.min_order)
+                    if not message:
+                        message = "规则通过，正式运行将保存绑定并邀请"
+                        owners[order] = record
+                print("预演：" + message)
                 continue
-            if not invitation.get("id"):
+            try:
+                self.process(record, owners, team, pending)
+            except ApiError as exc:
+                if exc.service.startswith("飞书"):
+                    # 飞书故障时无法保证状态写入，停止后依靠已保存的绑定恢复。
+                    raise
                 self.errors += 1
-                self.update(record, "结果待确认", "邀请响应缺少 ID，不自动重新发送")
-                continue
-            pending.append(invitation)
-            self.update(record, "邀请待接受", "邀请已发送，请在 GitHub 接受", **{
-                INVITE_ID: str(invitation["id"]), LOGIN: invitation.get("login") or ""})
+                self.update(record, "结果待确认", f"GitHub 状态核对失败：{exc}；不重复发送邀请")
         print(f"处理结束：读取 {len(records)} 条，本轮邀请请求 {self.sent} 次，异常 {self.errors} 次，预演={self.config.dry_run}")
         return 1 if self.errors else 0
 
