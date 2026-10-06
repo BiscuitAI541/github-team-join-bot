@@ -1,0 +1,43 @@
+name: Sync cityLen Invitations
+
+on:
+  schedule:
+    - cron: '*/5 * * * *' # 改成 */10 即每 10 分钟执行
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '仅预演，不写飞书、不发送邀请'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# 防止定时与手动运行同时处理同一订单；正在处理的写请求不会被新任务取消。
+concurrency:
+  group: citylen-invitations
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: vars.CITYLEN_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Read Feishu and invite to cityLen
+        env:
+          FEISHU_APP_ID: ${{ secrets.CITYLEN_FEISHU_APP_ID || secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.CITYLEN_FEISHU_APP_SECRET || secrets.FEISHU_APP_SECRET }}
+          CITYLEN_FEISHU_APP_TOKEN: ${{ secrets.CITYLEN_FEISHU_APP_TOKEN }}
+          CITYLEN_FEISHU_TABLE_ID: ${{ secrets.CITYLEN_FEISHU_TABLE_ID || vars.CITYLEN_FEISHU_TABLE_ID || 'tbl5whiFd7Lgr1fX' }}
+          CITYLEN_MIN_ORDER_NO: ${{ secrets.CITYLEN_MIN_ORDER_NO }}
+          ORG_ADMIN_PAT: ${{ secrets.CITYLEN_ORG_ADMIN_PAT || secrets.ORG_ADMIN_PAT }}
+          CITYLEN_ORG: ${{ vars.CITYLEN_ORG || github.repository_owner }}
+          CITYLEN_TEAM_NAME: cityLen
+          CITYLEN_MAX_INVITES: ${{ vars.CITYLEN_MAX_INVITES || '20' }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+        run: python scripts/sync_citylen.py

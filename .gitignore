@@ -8,3 +8,7 @@
 .env
 .env.*
 !.env.example
+
+# Python local verification
+__pycache__/
+*.py[cod]
